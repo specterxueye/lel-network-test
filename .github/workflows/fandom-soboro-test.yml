@@ -1,0 +1,221 @@
+
+name: Fandom Soboro IG 2026 Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      api_access_approved:
+        description: "Fandom automated API access permission obtained"
+        type: boolean
+        required: true
+        default: false
+      redistribution_approved:
+        description: "Public redistribution of this image is authorized"
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    if: ${{ inputs.api_access_approved }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Query Fandom API
+        env:
+          DOWNLOAD_IMAGE: ${{ inputs.redistribution_approved }}
+        run: |
+          mkdir -p out
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          from urllib.parse import urlencode
+          from urllib.request import Request, urlopen
+          from urllib.error import HTTPError
+
+          API = "https://lol.fandom.com/api.php"
+          OUT = Path("out")
+
+          def query(**params):
+              p = {
+                  "action": "query",
+                  "format": "json",
+                  "formatversion": "2",
+                  **params,
+              }
+              url = API + "?" + urlencode(p)
+              request = Request(
+                  url,
+                  headers={"User-Agent": "LEL-Image-API-Test/1.0"}
+              )
+              try:
+                  with urlopen(request, timeout=25) as r:
+                      return json.load(r)
+              except HTTPError as e:
+                  raise RuntimeError(
+                      f"Fandom API returned HTTP {e.code}"
+                  ) from e
+
+          # Find the actual file title. Do not guess a URL.
+          titles = set()
+          continuation = {}
+
+          for _ in range(5):
+              data = query(
+                  prop="images",
+                  titles="Soboro",
+                  imlimit="max",
+                  **continuation,
+              )
+              for page in data.get("query", {}).get("pages", []):
+                  for entry in page.get("images", []):
+                      titles.add(entry["title"])
+              continuation = data.get("continue", {})
+              if not continuation:
+                  break
+
+          # Search file namespace if the gallery was not listed.
+          matches = [
+              title for title in titles
+              if "soboro" in title.lower()
+              and "2026" in title.lower()
+              and "ig" in title.lower()
+          ]
+
+          if not matches:
+              data = query(
+                  list="search",
+                  srsearch="Soboro 2026",
+                  srnamespace="6",
+                  srlimit="50",
+              )
+              titles.update(
+                  item["title"]
+                  for item in data.get("query", {}).get("search", [])
+              )
+              matches = [
+                  title for title in titles
+                  if "soboro" in title.lower()
+                  and "2026" in title.lower()
+                  and "ig" in title.lower()
+              ]
+
+          if not matches:
+              print("Candidates:", sorted(titles))
+              raise RuntimeError(
+                  "IG 2026 Soboro portrait was not found"
+              )
+
+          matches.sort(
+              key=lambda t: (
+                  "split 1" not in t.lower(),
+                  t.lower(),
+              )
+          )
+          title = matches[0]
+          print("Selected:", title)
+
+          data = query(
+              prop="imageinfo",
+              titles=title,
+              iiprop="url|size|mime|extmetadata",
+          )
+
+          pages = data.get("query", {}).get("pages", [])
+          details = (
+              pages[0].get("imageinfo", [])
+              if pages else []
+          )
+
+          if not details:
+              raise RuntimeError("No imageinfo returned")
+
+          info = details[0]
+          report = {
+              "player": "Soboro",
+              "team": "Invictus Gaming",
+              "period": "LPL 2026 Split 1",
+              "fileTitle": title,
+              "filePage": info.get("descriptionurl"),
+              "imageUrl": info.get("url"),
+              "mime": info.get("mime"),
+              "size": info.get("size"),
+              "rightsMetadata": info.get("extmetadata", {}),
+              "imagePublished": False,
+          }
+
+          if os.environ["DOWNLOAD_IMAGE"] == "true":
+              image_url = info.get("url")
+              if not image_url:
+                  raise RuntimeError("Image URL missing")
+
+              request = Request(
+                  image_url,
+                  headers={"User-Agent": "LEL-Image-API-Test/1.0"},
+              )
+              with urlopen(request, timeout=45) as r:
+                  image_data = r.read(10 * 1024 * 1024 + 1)
+
+              if len(image_data) > 10 * 1024 * 1024:
+                  raise RuntimeError("Image exceeds 10 MiB")
+
+              if image_data.startswith(b"\x89PNG\r\n\x1a\n"):
+                  ext = "png"
+              elif image_data.startswith(b"\xff\xd8\xff"):
+                  ext = "jpg"
+              elif (
+                  image_data.startswith(b"RIFF")
+                  and image_data[8:12] == b"WEBP"
+              ):
+                  ext = "webp"
+              else:
+                  raise RuntimeError("Unexpected image format")
+
+              filename = f"soboro-ig-2026.{ext}"
+              (OUT / filename).write_bytes(image_data)
+              report["imagePublished"] = True
+              report["imageFilename"] = filename
+
+          (OUT / "soboro-ig-2026.json").write_text(
+              json.dumps(report, indent=2, ensure_ascii=False),
+              encoding="utf-8",
+          )
+
+          lines = []
+          for path in sorted(OUT.iterdir()):
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              lines.append(f"{digest}  {path.name}")
+
+          (OUT / "SHA256SUMS.txt").write_text(
+              "\n".join(lines) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Upload test report
+        uses: actions/upload-artifact@v4
+        with:
+          name: fandom-soboro-result
+          path: out/
+          retention-days: 3
+
+      - name: Publish test Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="fandom-soboro-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          gh release create "$TAG" out/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Soboro API test $GITHUB_RUN_ID" \
+            --notes "API connectivity and media metadata test." \
+            --prerelease \
+            --latest=false
+
+          echo "Release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}" >> "$GITHUB_STEP_SUMMARY"
